@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OCR Review &amp; Edit</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root{
+    --ink:#2b2b28;
+    --paper:#faf9f6;
+    --line:#d8d4cb;
+    --accent:#6b5b45;
+    --accent-soft:#efe9df;
+    --danger:#9a4b3f;
+    --ok:#4b6b4b;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;margin:0;}
+  body{
+    font-family:"Georgia","Times New Roman",serif;
+    background:var(--paper);
+    color:var(--ink);
+    display:flex;
+    flex-direction:column;
+  }
+  header{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:8px 14px;
+    background:#fff;
+    border-bottom:1px solid var(--line);
+    flex-wrap:wrap;
+  }
+  header h1{
+    font-size:14px;
+    font-weight:normal;
+    letter-spacing:0.5px;
+    color:var(--accent);
+    margin:0 14px 0 0;
+    white-space:nowrap;
+  }
+  button{
+    font-family:inherit;
+    font-size:13px;
+    background:#fff;
+    border:1px solid var(--line);
+    color:var(--ink);
+    padding:5px 10px;
+    border-radius:3px;
+    cursor:pointer;
+  }
+  button:hover:not(:disabled){background:var(--accent-soft);}
+  button:disabled{opacity:0.4;cursor:default;}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+  button.primary:hover:not(:disabled){opacity:0.9;}
+  .sep{width:1px;height:22px;background:var(--line);margin:0 4px;}
+  .pagebox{display:flex;align-items:center;gap:4px;font-size:13px;}
+  .pagebox input{
+    width:48px;font-family:inherit;font-size:13px;
+    border:1px solid var(--line);border-radius:3px;padding:4px;text-align:center;
+  }
+  .spacer{flex:1;}
+  #status{font-size:12px;color:#7a7568;white-space:nowrap;}
+  #status.unsaved{color:var(--danger);}
+  main{
+    flex:1;
+    display:flex;
+    min-height:0;
+  }
+  .pane{
+    flex:1 1 50%;
+    display:flex;
+    flex-direction:column;
+    min-width:0;
+    border-right:1px solid var(--line);
+  }
+  .pane:last-child{border-right:none;}
+  .pane-head{
+    font-size:11px;
+    letter-spacing:1px;
+    text-transform:uppercase;
+    color:#8a8478;
+    padding:6px 12px;
+    background:#f3f1ea;
+    border-bottom:1px solid var(--line);
+  }
+  #pdfViewport{
+    flex:1;
+    overflow:auto;
+    background:#e8e6df;
+    cursor:grab;
+    display:flex;
+    justify-content:center;
+    padding:16px;
+  }
+  #pdfViewport.grabbing{cursor:grabbing;}
+  #pdfCanvas{
+    background:#fff;
+    box-shadow:0 1px 6px rgba(0,0,0,0.25);
+    display:block;
+  }
+  #ocrFrameWrap{flex:1;overflow:hidden;position:relative;background:#fff;}
+  #ocrFrame{width:100%;height:100%;border:none;}
+  .placeholder{
+    display:flex;align-items:center;justify-content:center;
+    height:100%;color:#a39d8e;font-size:14px;text-align:center;padding:20px;
+  }
+  #zoomLabel{font-size:12px;color:#7a7568;width:40px;text-align:center;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OCR REVIEW</h1>
+  <button id="openPdfBtn">Open PDF…</button>
+  <button id="openFolderBtn">Open OCR Folder…</button>
+  <span id="folderMode" style="font-size:11px;color:#a39d8e;"></span>
+  <div class="sep"></div>
+  <button id="prevBtn" disabled>◀</button>
+  <div class="pagebox">
+    <input id="pageInput" type="number" min="1" value="1" disabled>
+    <span>/ <span id="totalPages">–</span></span>
+  </div>
+  <button id="nextBtn" disabled>▶</button>
+  <div class="sep"></div>
+  <button id="zoomOutBtn" disabled>–</button>
+  <span id="zoomLabel">100%</span>
+  <button id="zoomInBtn" disabled>+</button>
+  <button id="zoomResetBtn" disabled>Fit</button>
+  <div class="spacer"></div>
+  <span id="status"></span>
+  <button id="saveBtn" class="primary" disabled>Save</button>
+</header>
+
+<main>
+  <div class="pane">
+    <div class="pane-head">Source PDF</div>
+    <div id="pdfViewport"><div class="placeholder" id="pdfPlaceholder">Open a PDF to begin</div></div>
+  </div>
+  <div class="pane">
+    <div class="pane-head" id="ocrHead">OCR Text</div>
+    <div id="ocrFrameWrap"><div class="placeholder" id="ocrPlaceholder">Open the OCR folder to view/edit text</div></div>
+  </div>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// ---- state ----
+let pdfDoc = null;
+let currentPage = 1;
+let totalPages = 1;
+let renderScale = 1.4;
+let renderTask = null;
+let renderDebounce = null;
+
+let ocrByPage = new Map();      // pageNum -> { handle } | { file }
+let ocrPadLen = 4;
+let ocrPrefix = "";
+let usingFSApi = false;
+let currentFrameDoc = null;
+let unsaved = false;
+
+// ---- elements ----
+const el = id => document.getElementById(id);
+const openPdfBtn = el('openPdfBtn');
+const openFolderBtn = el('openFolderBtn');
+const folderModeLabel = el('folderMode');
+const prevBtn = el('prevBtn');
+const nextBtn = el('nextBtn');
+const pageInput = el('pageInput');
+const totalPagesLabel = el('totalPages');
+const zoomInBtn = el('zoomInBtn');
+const zoomOutBtn = el('zoomOutBtn');
+const zoomResetBtn = el('zoomResetBtn');
+const zoomLabel = el('zoomLabel');
+const statusEl = el('status');
+const saveBtn = el('saveBtn');
+const pdfViewport = el('pdfViewport');
+const ocrHead = el('ocrHead');
+const ocrFrameWrap = el('ocrFrameWrap');
+
+// ---- PDF loading ----
+const pdfInput = document.createElement('input');
+pdfInput.type = 'file'; pdfInput.accept = 'application/pdf';
+pdfInput.addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const buf = await file.arrayBuffer();
+  pdfDoc = await pdfjsLib.getDocument({data: buf}).promise;
+  totalPages = pdfDoc.numPages;
+  totalPagesLabel.textContent = totalPages;
+  pageInput.max = totalPages;
+  pageInput.disabled = false;
+  currentPage = 1;
+  enableNavAndZoom();
+  goToPage(1);
+});
+openPdfBtn.addEventListener('click', () => pdfInput.click());
+
+function enableNavAndZoom(){
+  prevBtn.disabled = false; nextBtn.disabled = false;
+  zoomInBtn.disabled = false; zoomOutBtn.disabled = false; zoomResetBtn.disabled = false;
+}
+
+async function renderPdfPage(num){
+  if (!pdfDoc) return;
+  const page = await pdfDoc.getPage(num);
+  const viewport = page.getViewport({scale: renderScale});
+  let canvas = document.getElementById('pdfCanvas');
+  if (!canvas){
+    canvas = document.createElement('canvas');
+    canvas.id = 'pdfCanvas';
+    pdfViewport.innerHTML = '';
+    pdfViewport.appendChild(canvas);
+  }
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  if (renderTask) { try { renderTask.cancel(); } catch(e){} }
+  renderTask = page.render({canvasContext: ctx, viewport});
+  try { await renderTask.promise; } catch(e){ /* cancelled render, ignore */ }
+}
+
+// ---- Zoom ----
+function setZoom(scale){
+  renderScale = Math.min(4, Math.max(0.4, scale));
+  zoomLabel.textContent = Math.round((renderScale/1.4)*100) + '%';
+  clearTimeout(renderDebounce);
+  renderDebounce = setTimeout(() => renderPdfPage(currentPage), 120);
+}
+zoomInBtn.addEventListener('click', () => setZoom(renderScale * 1.2));
+zoomOutBtn.addEventListener('click', () => setZoom(renderScale / 1.2));
+zoomResetBtn.addEventListener('click', () => setZoom(1.4));
+
+pdfViewport.addEventListener('wheel', e => {
+  if (e.ctrlKey){
+    e.preventDefault();
+    setZoom(renderScale * (e.deltaY < 0 ? 1.1 : 1/1.1));
+  }
+}, {passive:false});
+
+// ---- Pan (drag to scroll) ----
+let dragging = false, dragStartX=0, dragStartY=0, startScrollL=0, startScrollT=0;
+pdfViewport.addEventListener('mousedown', e => {
+  dragging = true;
+  pdfViewport.classList.add('grabbing');
+  dragStartX = e.clientX; dragStartY = e.clientY;
+  startScrollL = pdfViewport.scrollLeft; startScrollT = pdfViewport.scrollTop;
+});
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  pdfViewport.scrollLeft = startScrollL - (e.clientX - dragStartX);
+  pdfViewport.scrollTop = startScrollT - (e.clientY - dragStartY);
+});
+window.addEventListener('mouseup', () => { dragging=false; pdfViewport.classList.remove('grabbing'); });
+
+// ---- Page navigation ----
+async function goToPage(num){
+  if (unsaved){
+    const ok = confirm('You have unsaved edits on the current OCR page. Discard them?');
+    if (!ok) return;
+  }
+  num = Math.min(totalPages, Math.max(1, num));
+  currentPage = num;
+  pageInput.value = num;
+  prevBtn.disabled = num <= 1;
+  nextBtn.disabled = num >= totalPages;
+  await renderPdfPage(num);
+  await loadOcrForPage(num);
+}
+prevBtn.addEventListener('click', () => goToPage(currentPage - 1));
+nextBtn.addEventListener('click', () => goToPage(currentPage + 1));
+pageInput.addEventListener('change', () => goToPage(parseInt(pageInput.value, 10) || 1));
+window.addEventListener('keydown', e => {
+  if (document.activeElement === pageInput) return;
+  if (e.key === 'ArrowLeft') goToPage(currentPage - 1);
+  if (e.key === 'ArrowRight') goToPage(currentPage + 1);
+});
+
+// ---- OCR folder loading ----
+const PAGE_RE = /^(.*?)_page(\d+)\.html$/i;
+
+openFolderBtn.addEventListener('click', async () => {
+  ocrByPage.clear();
+  if (window.showDirectoryPicker){
+    try {
+      const dirHandle = await window.showDirectoryPicker();
+      usingFSApi = true;
+      for await (const [name, handle] of dirHandle.entries()){
+        if (handle.kind !== 'file') continue;
+        const m = name.match(PAGE_RE);
+        if (!m) continue;
+        const pageNum = parseInt(m[2], 10);
+        if (!ocrPrefix) { ocrPrefix = m[1]; ocrPadLen = m[2].length; }
+        ocrByPage.set(pageNum, {handle});
+      }
+      folderModeLabel.textContent = 'Folder linked (editable, saves in place)';
+      finishFolderLoad();
+      return;
+    } catch(err){
+      if (err.name === 'AbortError') return;
+      // fall through to fallback on other errors
+    }
+  }
+  fallbackInput.click();
+});
+
+const fallbackInput = document.createElement('input');
+fallbackInput.type = 'file'; fallbackInput.webkitdirectory = true; fallbackInput.multiple = true;
+fallbackInput.addEventListener('change', e => {
+  ocrByPage.clear();
+  usingFSApi = false;
+  for (const file of e.target.files){
+    const m = file.name.match(PAGE_RE);
+    if (!m) continue;
+    const pageNum = parseInt(m[2], 10);
+    if (!ocrPrefix) { ocrPrefix = m[1]; ocrPadLen = m[2].length; }
+    ocrByPage.set(pageNum, {file});
+  }
+  folderModeLabel.textContent = 'Folder loaded (read-only browser access — Save will download the edited file)';
+  finishFolderLoad();
+});
+
+function finishFolderLoad(){
+  if (ocrByPage.size === 0){
+    alert('No files matching the pattern "*_page####.html" were found in that folder.');
+    return;
+  }
+  saveBtn.disabled = false;
+  if (pdfDoc) loadOcrForPage(currentPage);
+  else loadOcrForPage(Math.min(...ocrByPage.keys()));
+}
+
+async function loadOcrForPage(num){
+  ocrFrameWrap.innerHTML = '';
+  currentFrameDoc = null;
+  unsaved = false;
+  updateStatus('');
+  const entry = ocrByPage.get(num);
+  ocrHead.textContent = ocrPrefix ? `OCR Text — ${ocrPrefix}_page${String(num).padStart(ocrPadLen,'0')}.html` : 'OCR Text';
+  if (!entry){
+    ocrFrameWrap.innerHTML = `<div class="placeholder">No OCR file found for page ${num}.</div>`;
+    return;
+  }
+  const file = entry.handle ? await entry.handle.getFile() : entry.file;
+  const text = await file.text();
+  const iframe = document.createElement('iframe');
+  iframe.id = 'ocrFrame';
+  ocrFrameWrap.appendChild(iframe);
+  iframe.addEventListener('load', () => {
+    const doc = iframe.contentDocument;
+    currentFrameDoc = doc;
+    if (doc.body){
+      doc.body.contentEditable = 'true';
+      doc.body.spellcheck = false;
+      doc.body.addEventListener('input', () => { unsaved = true; updateStatus('Unsaved changes'); });
+    }
+  });
+  iframe.srcdoc = text;
+}
+
+function updateStatus(msg){
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('unsaved', !!msg);
+}
+
+// ---- Save ----
+saveBtn.addEventListener('click', async () => {
+  if (!currentFrameDoc){ return; }
+  const entry = ocrByPage.get(currentPage);
+  if (!entry){ return; }
+  const html = '<!DOCTYPE html>\n' + currentFrameDoc.documentElement.outerHTML;
+  if (entry.handle){
+    try {
+      const writable = await entry.handle.createWritable();
+      await writable.write(html);
+      await writable.close();
+      unsaved = false;
+      updateStatus('Saved');
+      setTimeout(() => updateStatus(''), 1500);
+    } catch(err){
+      alert('Could not save file: ' + err.message);
+    }
+  } else {
+    const blob = new Blob([html], {type:'text/html'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${ocrPrefix}_page${String(currentPage).padStart(ocrPadLen,'0')}.html`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    unsaved = false;
+    updateStatus('Downloaded');
+    setTimeout(() => updateStatus(''), 1500);
+  }
+});
+
+window.addEventListener('beforeunload', e => {
+  if (unsaved){ e.preventDefault(); e.returnValue=''; }
+});
+</script>
+</body>
+</html>
